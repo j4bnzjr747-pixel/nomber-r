@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>iPad + iPhone Игра</title>
+    <script src="https://unpkg.com/mqtt@5.3.0/dist/mqtt.min.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; user-select: none; -webkit-user-select: none; }
+        body { background: #111; color: white; font-family: -apple-system, sans-serif; overflow: hidden; height: 100vh; }
+
+        #host-screen, #controller-screen { display: none; height: 100vh; width: 100vw; }
+        #status {
+            position: fixed; top: 20px; right: 20px;
+            padding: 10px 20px; border-radius: 20px;
+            font-size: 14px; z-index: 100;
+        }
+        .status-connected { background: #27ae60; }
+        .status-disconnected { background: #c0392b; }
+        .status-waiting { background: #e67e22; }
+
+        #log {
+            position: fixed; bottom: 0; left: 0; right: 0;
+            background: rgba(0,0,0,0.9); color: #0f0;
+            font-family: monospace; font-size: 11px;
+            padding: 8px; max-height: 20vh; overflow-y: auto;
+            z-index: 999; white-space: pre-wrap;
+        }
+        .hidden { display: none !important; }
+
+        #host-screen { background: #1a1a1a; }
+        #game-area { position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: 1; }
+        #player {
+            position: absolute; width: 80px; height: 80px;
+            background: #4A90E2; border-radius: 20px;
+            box-shadow: 0 0 30px rgba(74,144,226,0.6); z-index: 2;
+        }
+        #connection-info {
+            position: absolute; bottom: 25vh; left: 20px;
+            background: rgba(0,0,0,0.85); padding: 15px;
+            border-radius: 15px; z-index: 10; border: 1px solid #333;
+        }
+        #peer-id-text { font-size: 22px; color: #fff; font-weight: bold; }
+        #peer-id-text span { color: #4A90E2; }
+
+        #controller-screen {
+            display: flex; flex-direction: column;
+            justify-content: center; align-items: center; background: #222;
+        }
+        .btn-grid {
+            display: grid; grid-template-columns: repeat(3, 1fr);
+            gap: 20px; width: 90%; max-width: 400px;
+        }
+        .btn {
+            background: #333; border: 2px solid #555; color: white;
+            font-size: 40px; border-radius: 25px; padding: 40px 0;
+            text-align: center; cursor: pointer;
+        }
+        .btn:active { background: #4A90E2; transform: scale(0.95); }
+        .btn-empty { background: transparent; border: none; }
+
+        #connect-ui { text-align: center; padding: 20px; }
+        #connect-ui input {
+            padding: 15px; font-size: 18px; border-radius: 10px;
+            border: 2px solid #444; background: #111; color: white;
+            width: 80%; max-width: 300px; margin-bottom: 15px; text-align: center;
+        }
+        #connect-ui button {
+            padding: 15px 40px; font-size: 18px;
+            background: #4A90E2; color: white; border: none;
+            border-radius: 10px; cursor: pointer;
+        }
+    </style>
+</head>
+<body>
+
+    <!-- ЭКРАН iPAD (ИГРА) -->
+    <div id="host-screen">
+        <div id="game-area"><div id="player"></div></div>
+        <div id="connection-info">
+            <div id="peer-id-text">Ваш ID: <span id="my-id-display">...</span></div>
+        </div>
+    </div>
+
+    <!-- ЭКРАН iPHONE (ПУЛЬТ) -->
+    <div id="controller-screen">
+        <div id="connect-ui">
+            <h2 style="margin-bottom: 20px;">Подключение к игре</h2>
+            <p style="color:#aaa; margin-bottom: 20px;">Введите ID с iPad</p>
+            <input type="text" id="host-id-input" placeholder="game-XXXX">
+            <br>
+            <button onclick="connectToHost()">Подключиться</button>
+        </div>
+
+        <div id="controls" class="hidden" style="width: 100%; display: flex; flex-direction: column; align-items: center;">
+            <div class="btn-grid">
+                <div class="btn-empty"></div>
+                <div class="btn" ontouchstart="sendCmd('UP')" onmousedown="sendCmd('UP')">▲</div>
+                <div class="btn-empty"></div>
+                <div class="btn" ontouchstart="sendCmd('LEFT')" onmousedown="sendCmd('LEFT')">◀</div>
+                <div class="btn" ontouchstart="sendCmd('DOWN')" onmousedown="sendCmd('DOWN')">▼</div>
+                <div class="btn" ontouchstart="sendCmd('RIGHT')" onmousedown="sendCmd('RIGHT')">▶</div>
+            </div>
+        </div>
+    </div>
+
+    <div id="status" class="status-disconnected">Не подключено</div>
+    <div id="log">--- Журнал ---</div>
+
+    <script>
+        const isIPad = window.innerWidth > 600;
+
+        let client = null;
+        let myRoom = null;
+        let playerX = 100;
+        let playerY = 100;
+        let lastSeen = 0;
+        const step = 25;
+
+        function log(msg) {
+            const logEl = document.getElementById('log');
+            const time = new Date().toLocaleTimeString();
+            logEl.textContent += '\n[' + time + '] ' + msg;
+            logEl.scrollTop = logEl.scrollHeight;
+            console.log(msg);
+        }
+
+        function setStatus(text, cls) {
+            const el = document.getElementById('status');
+            el.innerText = text;
+            el.className = cls;
+        }
+
+        // === ПУБЛИЧНЫЙ MQTT-БРОКЕР (бесплатный, без регистрации) ===
+        // Работает через WebSocket Secure (порт 8084) — не блокируется провайдерами
+        const BROKER_URL = 'wss://broker.emqx.io:8084/mqtt';
+
+        log('Запуск. Режим: ' + (isIPad ? 'iPad (игра)' : 'iPhone (пульт)'));
+
+        if (isIPad) {
+            // ============ iPad: ИГРА ============
+            document.getElementById('host-screen').style.display = 'block';
+            playerX = window.innerWidth / 2 - 40;
+            playerY = window.innerHeight / 2 - 40;
+            document.getElementById('player').style.left = playerX + 'px';
+            document.getElementById('player').style.top = playerY + 'px';
+
+            const myId = 'game-' + Math.floor(Math.random() * 9000 + 1000);
+            document.getElementById('my-id-display').innerText = myId;
+            log('Мой ID: ' + myId);
+
+            myRoom = 'ipad-iphone-game/' + myId + '/commands';
+            log('Подключаюсь к брокеру...');
+
+            client = mqtt.connect(BROKER_URL, {
+                clientId: 'ipad_' + Math.random().toString(16).slice(2, 10),
+                clean: true,
+                reconnectPeriod: 3000
+            });
+
+            client.on('connect', () => {
+                log('✅ Подключён к брокеру');
+                client.subscribe(myRoom, (err) => {
+                    if (err) {
+                        log('❌ Не удалось подписаться: ' + err);
+                    } else {
+                        log('✅ Слушаю комнату: ' + myId);
+                        setStatus('Жду телефон...', 'status-waiting');
+                    }
+                });
+            });
+
+            client.on('error', (err) => {
+                log('❌ Ошибка брокера: ' + err);
+            });
+
+            client.on('reconnect', () => log('🔄 Переподключаюсь...'));
+            client.on('offline', () => log('⚠️ Офлайн'));
+
+            // Приём команд от iPhone
+            client.on('message', (topic, payload) => {
+                const cmd = payload.toString();
+                lastSeen = Date.now();
+
+                if (cmd === 'PING') {
+                    log('📱 iPhone на связи');
+                    setStatus('✅ Подключено', 'status-connected');
+                    document.getElementById('connection-info').style.display = 'none';
+                    return;
+                }
+
+                log('→ Команда: ' + cmd);
+                if (['UP', 'DOWN', 'LEFT', 'RIGHT'].includes(cmd)) {
+                    movePlayer(cmd);
+                    setStatus('✅ Подключено', 'status-connected');
+                    document.getElementById('connection-info').style.display = 'none';
+                }
+            });
+
+            // Если 10 секунд нет команд — считаем, что телефон отключился
+            setInterval(() => {
+                if (lastSeen !== 0 && Date.now() - lastSeen > 10000) {
+                    setStatus('Жду телефон...', 'status-waiting');
+                    document.getElementById('connection-info').style.display = 'block';
+                }
+            }, 3000);
+
+        } else {
+            // ============ iPhone: ПУЛЬТ ============
+            document.getElementById('controller-screen').style.display = 'flex';
+
+            window.connectToHost = function() {
+                const hostId = document.getElementById('host-id-input').value.trim();
+                if (!hostId) { alert('Введите ID с iPad!'); return; }
+
+                myRoom = 'ipad-iphone-game/' + hostId + '/commands';
+                log('Подключаюсь к комнате: ' + hostId);
+                log('Брокер: ' + BROKER_URL);
+
+                client = mqtt.connect(BROKER_URL, {
+                    clientId: 'iphone_' + Math.random().toString(16).slice(2, 10),
+                    clean: true,
+                    reconnectPeriod: 3000
+                });
+
+                client.on('connect', () => {
+                    log('✅ Подключён к брокеру');
+                    log('✅✅ ГОТОВО! Управляй кнопками.');
+
+                    setStatus('✅ Подключено', 'status-connected');
+                    document.getElementById('connect-ui').classList.add('hidden');
+                    document.getElementById('controls').classList.remove('hidden');
+
+                    // Раз в 3 секунды шлём PING, чтобы iPad знал, что мы на месте
+                    setInterval(() => {
+                        if (client && client.connected) {
+                            client.publish(myRoom, 'PING');
+                        }
+                    }, 3000);
+                });
+
+                client.on('error', (err) => {
+                    log('❌ Ошибка брокера: ' + err);
+                    alert('Не удалось подключиться к брокеру. Проверь интернет.');
+                });
+
+                client.on('reconnect', () => log('🔄 Переподключаюсь...'));
+                client.on('offline', () => log('⚠️ Офлайн'));
+            };
+
+            window.sendCmd = function(cmd) {
+                if (client && client.connected) {
+                    client.publish(myRoom, cmd);
+                } else {
+                    log('⚠️ Не отправлено (нет связи с брокером): ' + cmd);
+                }
+            };
+        }
+
+        function movePlayer(direction) {
+            const playerEl = document.getElementById('player');
+            const maxX = window.innerWidth - 80;
+            const maxY = window.innerHeight - 80;
+            if (direction === 'UP')    playerY = Math.max(0, playerY - step);
+            if (direction === 'DOWN')  playerY = Math.min(maxY, playerY + step);
+            if (direction === 'LEFT')  playerX = Math.max(0, playerX - step);
+            if (direction === 'RIGHT') playerX = Math.min(maxX, playerX + step);
+            playerEl.style.left = playerX + 'px';
+            playerEl.style.top = playerY + 'px';
+        }
+    </script>
+</body>
+</html>
